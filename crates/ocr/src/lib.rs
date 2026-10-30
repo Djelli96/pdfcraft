@@ -627,16 +627,32 @@ mod tests {
         assert!(s.starts_with("/OCR BMC") && s.ends_with("EMC\n"));
     }
 
-    /// Verify NaN and infinite placements are omitted from generated PDF operators.
+    /// Verify non-finite and overflowing placements are omitted from generated PDF operators.
     #[test]
     fn invalid_coordinates_are_not_written_to_pdf_content() {
-        let invalid = PlacedWord { text: "Hi".into(), origin: [f64::NAN, 20.0], across: [30.0, 0.0], up: [0.0, 9.3] };
-        let layer = String::from_utf8(text_layer(&[invalid])).unwrap();
-        assert!(!layer.contains("NaN"));
-        assert!(!layer.contains("inf"));
-        assert!(!layer.contains(" Tj "));
-        assert!(layer.starts_with("/OCR BMC"));
-        assert!(layer.ends_with("EMC\n"));
+        let overflow = PlacedWord { text: "Gap".into(), origin: [10.0, f64::MAX * 0.9], across: [30.0, 0.0], up: [0.0, f64::MAX * 0.835] };
+        let (top, bottom) = ink_extent(&overflow.text);
+        let em_y = overflow.up[1] / (top - bottom);
+        assert!(overflow.origin[1].is_finite() && overflow.up[1].is_finite() && em_y.is_finite());
+        assert!((overflow.origin[1] - em_y * bottom).is_infinite(), "the finite overflow fixture must overflow while building the text matrix");
+
+        let invalid = [
+            PlacedWord { text: "Hi".into(), origin: [f64::NAN, 20.0], across: [30.0, 0.0], up: [0.0, 9.3] },
+            PlacedWord { text: "Hi".into(), origin: [10.0, f64::INFINITY], across: [30.0, 0.0], up: [0.0, 9.3] },
+            PlacedWord { text: "Hi".into(), origin: [10.0, 20.0], across: [f64::NEG_INFINITY, 0.0], up: [0.0, 9.3] },
+            PlacedWord { text: "Hi".into(), origin: [10.0, 20.0], across: [30.0, f64::NAN], up: [0.0, 9.3] },
+            PlacedWord { text: "Hi".into(), origin: [10.0, 20.0], across: [30.0, 0.0], up: [f64::INFINITY, 9.3] },
+            PlacedWord { text: "Hi".into(), origin: [10.0, 20.0], across: [30.0, 0.0], up: [0.0, f64::NEG_INFINITY] },
+            overflow,
+        ];
+        let layer = String::from_utf8(text_layer(&invalid)).unwrap();
+
+        assert!(!layer.contains("NaN"), "{layer}");
+        assert!(!layer.contains("inf"), "{layer}");
+        assert!(!layer.contains(" Tm "), "invalid placements emitted a text matrix: {layer}");
+        assert!(!layer.contains(" Tj\n"), "invalid placements emitted a text-show operator: {layer}");
+        assert!(layer.starts_with("/OCR BMC\nq\nBT\n3 Tr\n/PCHelv 1 Tf\n"));
+        assert!(layer.ends_with("ET\nQ\nEMC\n"));
     }
 
     /// Verify the OCR text layer balances its graphics-state and marked-content operators.
