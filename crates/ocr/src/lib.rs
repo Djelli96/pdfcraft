@@ -725,7 +725,7 @@ mod tests {
 
     /// A complete ONNX pair is sufficient, and takes precedence over a legacy pair beside it.
     #[test]
-    fn model_discovery_prefers_the_onnx_pair_over_legacy() {
+    fn model_discovery_prefers_the_complete_onnx_pair() {
         let scratch = ScratchDir::new("prefers-onnx");
         let dir = scratch.path();
         let expected = Some(Models { detection: dir.join(DETECTION_MODEL), recognition: dir.join(RECOGNITION_MODEL) });
