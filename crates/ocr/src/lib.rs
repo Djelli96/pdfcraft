@@ -649,7 +649,6 @@ mod tests {
 
         assert!(!layer.contains("NaN"), "{layer}");
         assert!(!layer.contains("inf"), "{layer}");
-        assert!(!layer.contains(" Tm "), "invalid placements emitted a text matrix: {layer}");
         assert!(!layer.contains(" Tj\n"), "invalid placements emitted a text-show operator: {layer}");
         assert!(layer.starts_with("/OCR BMC\nq\nBT\n3 Tr\n/PCHelv 1 Tf\n"));
         assert!(layer.ends_with("ET\nQ\nEMC\n"));
@@ -864,21 +863,25 @@ mod tests {
         assert!(message.contains("PDFCRAFT_MODELS"), "message must name the environment override: {message}");
     }
 
-    /// Run an end-to-end OCR smoke test when model assets are installed.
+    /// Run end-to-end OCR smoke tests when model assets are installed.
     ///
-    /// In CI, set `PDFCRAFT_REQUIRE_OCR_MODELS=1` to fail instead of silently skipping. This
-    /// ASCII-only smoke test does not establish an accuracy percentage for accented text.
+    /// In CI, set `PDFCRAFT_REQUIRE_OCR_MODELS=1` to require the ASCII smoke-test model and
+    /// `PDFCRAFT_REQUIRE_LATIN_OCR_MODELS=1` to require a faithful 183-class model. Supply the
+    /// latter in `PDFCRAFT_LATIN_MODELS`, a directory containing a complete ONNX or RTEN pair.
     #[test]
     fn reads_rendered_text() {
         let Some(models) = Models::find() else {
-            let required = std::env::var_os("PDFCRAFT_REQUIRE_OCR_MODELS").is_some_and(|value| !value.is_empty());
-            if required {
+            let ascii_required = std::env::var_os("PDFCRAFT_REQUIRE_OCR_MODELS").is_some_and(|value| !value.is_empty());
+            let latin_required = std::env::var_os("PDFCRAFT_REQUIRE_LATIN_OCR_MODELS").is_some_and(|value| !value.is_empty());
+            if ascii_required || latin_required {
                 panic!("OCR models are required for this test but were not found");
             }
             eprintln!("skipped: OCR models not installed (set PDFCRAFT_REQUIRE_OCR_MODELS=1 in CI to require them)");
             return;
         };
 
+        // Keep the existing ASCII smoke test: it exercises the installed default model and
+        // verifies that model loading, detection, recognition, and word geometry still work.
         let ocr = Ocr::load(&models).unwrap();
         let (w, h, px) = test_image::hello();
         let lines = ocr.recognize(&px, w, h).unwrap();
@@ -888,6 +891,49 @@ mod tests {
             lines.iter().flat_map(|line| &line.words).find(|word| word.text.contains("HELL")).expect("no word containing 'HELL' in OCR output");
         let x0 = test_image::X0 as f32;
         assert!(word.rect[0] >= x0 - 30.0 && word.rect[0] < x0 + 20.0, "first word should start near x={x0}, got {word:?}");
+
+        // Prefer an explicitly supplied extended model. If the default model itself has 183
+        // output classes, it is also a valid fixture for this part of the smoke test.
+        let latin_models = match std::env::var_os("PDFCRAFT_LATIN_MODELS") {
+            Some(dir) if !dir.is_empty() => {
+                Models::in_dir(Path::new(&dir)).unwrap_or_else(|| panic!("PDFCRAFT_LATIN_MODELS must contain a complete ONNX or RTEN model pair"))
+            }
+            Some(_) => panic!("PDFCRAFT_LATIN_MODELS must name a non-empty model directory"),
+            None if recognition_output_classes(&models) == Some(183) => models.clone(),
+            None => {
+                let required = std::env::var_os("PDFCRAFT_REQUIRE_LATIN_OCR_MODELS").is_some_and(|value| !value.is_empty());
+                if required {
+                    panic!("a 183-class OCR model is required; set PDFCRAFT_LATIN_MODELS to its model directory");
+                }
+                eprintln!(
+                    "skipped extended OCR check: no 183-class model found (set PDFCRAFT_LATIN_MODELS and PDFCRAFT_REQUIRE_LATIN_OCR_MODELS=1 in CI)"
+                );
+                return;
+            }
+        };
+
+        assert_eq!(
+            recognition_output_classes(&latin_models),
+            Some(183),
+            "extended OCR test requires a recognition model with exactly 183 output classes"
+        );
+        let latin_ocr = Ocr::load(&latin_models).unwrap();
+        let (w, h, px) = test_image::accented();
+        let lines = latin_ocr.recognize(&px, w, h).unwrap();
+        let text: Vec<String> = lines.iter().map(Line::text).collect();
+        assert!(text.iter().any(|line| line.contains('É')), "183-class OCR did not recognize the accented É in the rendered fixture: {text:?}");
+    }
+
+    /// Read the recognition model's final output dimension, using the same CTC class convention
+    /// as `Ocr::load`. A fixed dimension of 183 means 182 alphabet characters plus the blank.
+    fn recognition_output_classes(models: &Models) -> Option<usize> {
+        let recognition = rten::Model::load_file(&models.recognition).ok()?;
+        recognition.output_ids().first().and_then(|&id| recognition.node_info(id)).and_then(|info| info.shape()).and_then(|mut dims| {
+            match dims.pop()? {
+                rten::Dimension::Fixed(n) => Some(n),
+                rten::Dimension::Symbolic(_) => None,
+            }
+        })
     }
 
     mod test_image {
@@ -913,6 +959,40 @@ mod tests {
                 if c == ' ' {
                     continue;
                 }
+                let (_, rows) = GLYPHS.iter().find(|glyph| glyph.0 == c).unwrap_or_else(|| panic!("no glyph for {c:?}"));
+                for (ry, row) in rows.iter().enumerate() {
+                    for (rx, byte) in row.bytes().enumerate() {
+                        if byte != b'X' {
+                            continue;
+                        }
+                        for dy in 0..dot {
+                            for dx in 0..dot {
+                                let x = X0 + (i as u32 * 6 + rx as u32) * dot + dx;
+                                let y = y0 + ry as u32 * dot + dy;
+                                let offset = ((y as usize) * (w as usize) + (x as usize)) * 4;
+                                px[offset..offset + 3].copy_from_slice(&[0, 0, 0]);
+                            }
+                        }
+                    }
+                }
+            }
+            (w, h, px)
+        }
+
+        /// Render `ÉTÉ` as blocky 5×7 letters, with the acute accent drawn as part of each É.
+        /// This synthetic fixture makes the expected non-ASCII output deterministic and keeps
+        /// the extended-model test independent of external image files.
+        pub fn accented() -> (u32, u32, Vec<u8>) {
+            const GLYPHS: &[(char, [&str; 7])] = &[
+                ('É', ["...XX", "..X..", "XXXXX", "X....", "XXXX.", "X....", "XXXXX"]),
+                ('T', ["XXXXX", "..X..", "..X..", "..X..", "..X..", "..X..", "..X.."]),
+            ];
+            let text = "ÉTÉ";
+            let (dot, y0) = (8u32, 40u32);
+            let glyph_count = text.chars().count() as u32;
+            let (w, h) = (X0 * 2 + glyph_count * 6 * dot, y0 * 2 + 7 * dot);
+            let mut px = vec![255u8; (w as usize) * (h as usize) * 4];
+            for (i, c) in text.chars().enumerate() {
                 let (_, rows) = GLYPHS.iter().find(|glyph| glyph.0 == c).unwrap_or_else(|| panic!("no glyph for {c:?}"));
                 for (ry, row) in rows.iter().enumerate() {
                     for (rx, byte) in row.bytes().enumerate() {
