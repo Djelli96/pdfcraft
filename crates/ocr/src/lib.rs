@@ -649,6 +649,7 @@ mod tests {
 
         assert!(!layer.contains("NaN"), "{layer}");
         assert!(!layer.contains("inf"), "{layer}");
+        assert!(!layer.contains(" Tm "), "invalid placements emitted a text matrix: {layer}");
         assert!(!layer.contains(" Tj\n"), "invalid placements emitted a text-show operator: {layer}");
         assert!(layer.starts_with("/OCR BMC\nq\nBT\n3 Tr\n/PCHelv 1 Tf\n"));
         assert!(layer.ends_with("ET\nQ\nEMC\n"));
@@ -870,27 +871,29 @@ mod tests {
     /// latter in `PDFCRAFT_LATIN_MODELS`, a directory containing a complete ONNX or RTEN pair.
     #[test]
     fn reads_rendered_text() {
-        let Some(models) = Models::find() else {
-            let ascii_required = std::env::var_os("PDFCRAFT_REQUIRE_OCR_MODELS").is_some_and(|value| !value.is_empty());
-            let latin_required = std::env::var_os("PDFCRAFT_REQUIRE_LATIN_OCR_MODELS").is_some_and(|value| !value.is_empty());
-            if ascii_required || latin_required {
-                panic!("OCR models are required for this test but were not found");
+        // The default model and the extended model are independent fixtures. In particular,
+        // an explicitly configured 183-class model must still be tested when no default model
+        // pair is installed or discoverable.
+        let models = Models::find();
+        if let Some(models) = models.as_ref() {
+            // Keep the existing ASCII smoke test: it exercises the installed default model and
+            // verifies that model loading, detection, recognition, and word geometry still work.
+            let ocr = Ocr::load(models).unwrap();
+            let (w, h, px) = test_image::hello();
+            let lines = ocr.recognize(&px, w, h).unwrap();
+            let text: Vec<String> = lines.iter().map(Line::text).collect();
+            assert!(text.iter().any(|t| t.contains("HELL") && t.contains("WOR")), "{text:?}");
+            let word =
+                lines.iter().flat_map(|line| &line.words).find(|word| word.text.contains("HELL")).expect("no word containing 'HELL' in OCR output");
+            let x0 = test_image::X0 as f32;
+            assert!(word.rect[0] >= x0 - 30.0 && word.rect[0] < x0 + 20.0, "first word should start near x={x0}, got {word:?}");
+        } else {
+            let required = std::env::var_os("PDFCRAFT_REQUIRE_OCR_MODELS").is_some_and(|value| !value.is_empty());
+            if required {
+                panic!("default OCR models are required for the ASCII smoke test but were not found");
             }
-            eprintln!("skipped: OCR models not installed (set PDFCRAFT_REQUIRE_OCR_MODELS=1 in CI to require them)");
-            return;
-        };
-
-        // Keep the existing ASCII smoke test: it exercises the installed default model and
-        // verifies that model loading, detection, recognition, and word geometry still work.
-        let ocr = Ocr::load(&models).unwrap();
-        let (w, h, px) = test_image::hello();
-        let lines = ocr.recognize(&px, w, h).unwrap();
-        let text: Vec<String> = lines.iter().map(Line::text).collect();
-        assert!(text.iter().any(|t| t.contains("HELL") && t.contains("WOR")), "{text:?}");
-        let word =
-            lines.iter().flat_map(|line| &line.words).find(|word| word.text.contains("HELL")).expect("no word containing 'HELL' in OCR output");
-        let x0 = test_image::X0 as f32;
-        assert!(word.rect[0] >= x0 - 30.0 && word.rect[0] < x0 + 20.0, "first word should start near x={x0}, got {word:?}");
+            eprintln!("skipped ASCII OCR check: no default models found (set PDFCRAFT_REQUIRE_OCR_MODELS=1 in CI to require them)");
+        }
 
         // Prefer an explicitly supplied extended model. If the default model itself has 183
         // output classes, it is also a valid fixture for this part of the smoke test.
@@ -899,17 +902,19 @@ mod tests {
                 Models::in_dir(Path::new(&dir)).unwrap_or_else(|| panic!("PDFCRAFT_LATIN_MODELS must contain a complete ONNX or RTEN model pair"))
             }
             Some(_) => panic!("PDFCRAFT_LATIN_MODELS must name a non-empty model directory"),
-            None if recognition_output_classes(&models) == Some(183) => models.clone(),
-            None => {
-                let required = std::env::var_os("PDFCRAFT_REQUIRE_LATIN_OCR_MODELS").is_some_and(|value| !value.is_empty());
-                if required {
-                    panic!("a 183-class OCR model is required; set PDFCRAFT_LATIN_MODELS to its model directory");
+            None => match models.as_ref() {
+                Some(models) if recognition_output_classes(models) == Some(183) => models.clone(),
+                _ => {
+                    let required = std::env::var_os("PDFCRAFT_REQUIRE_LATIN_OCR_MODELS").is_some_and(|value| !value.is_empty());
+                    if required {
+                        panic!("a 183-class OCR model is required; set PDFCRAFT_LATIN_MODELS to its model directory");
+                    }
+                    eprintln!(
+                        "skipped extended OCR check: no 183-class model found (set PDFCRAFT_LATIN_MODELS and PDFCRAFT_REQUIRE_LATIN_OCR_MODELS=1 in CI)"
+                    );
+                    return;
                 }
-                eprintln!(
-                    "skipped extended OCR check: no 183-class model found (set PDFCRAFT_LATIN_MODELS and PDFCRAFT_REQUIRE_LATIN_OCR_MODELS=1 in CI)"
-                );
-                return;
-            }
+            },
         };
 
         assert_eq!(
