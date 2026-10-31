@@ -19,13 +19,7 @@ pub fn printer_options(printer: &str) -> Vec<PrinterOption> {
 pub fn printer_options_in(printer: &str, lang: &str) -> Vec<PrinterOption> {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     {
-        printer_options_via_within(
-            printer,
-            std::path::Path::new("/etc/cups/ppd"),
-            std::process::Command::new("lpoptions"),
-            LPOPTIONS_LIMIT,
-            lang,
-        )
+        printer_options_via_within(printer, std::path::Path::new("/etc/cups/ppd"), std::process::Command::new("lpoptions"), LPOPTIONS_LIMIT, lang)
     }
     #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
     {
@@ -99,19 +93,11 @@ pub(crate) fn output_within(command: &mut std::process::Command, limit: std::tim
         return Err(error);
     }
 
-    let timed_out = || {
-        std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("{:?} did not answer within {limit:?}", command.get_program()),
-        )
-    };
+    let timed_out = || std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{:?} did not answer within {limit:?}", command.get_program()));
     let output_uncollected = || {
         std::io::Error::new(
             std::io::ErrorKind::TimedOut,
-            format!(
-                "{:?} finished but its output was not closed within {OUTPUT_GRACE:?}",
-                command.get_program()
-            ),
+            format!("{:?} finished but its output was not closed within {OUTPUT_GRACE:?}", command.get_program()),
         )
     };
     let deadline = std::time::Instant::now() + limit;
@@ -124,9 +110,7 @@ pub(crate) fn output_within(command: &mut std::process::Command, limit: std::tim
                 return match rx.recv_timeout(OUTPUT_GRACE) {
                     Ok(read) => read,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(output_uncollected()),
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        Err(std::io::Error::other("the command's output was lost"))
-                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other("the command's output was lost")),
                 };
             }
             Ok(None) if std::time::Instant::now() >= deadline => {
@@ -299,7 +283,10 @@ pub(crate) fn localize(options: &mut [PrinterOption], ppd: &[u8], lang: &str) {
 
         if let Some(rest) = rest.strip_prefix("OpenGroup:") {
             // A localized OpenGroup directly maps its keyword to the translated label.
-            if let Some((label, key)) = parse_open_group(rest) {
+            // An empty label is no translation, so the existing name stays.
+            if let Some((label, key)) = parse_open_group(rest)
+                && !label.is_empty()
+            {
                 group_names.insert(key, label);
             }
             continue;
@@ -379,12 +366,13 @@ mod tests {
             choices: vec![("A4".into(), "A4".into())],
             default: "A4".into(),
         }];
-        let ppd = br#"
+        let ppd = r#"
 *OpenGroup: General/General: ""
 *bg.Translation General/Общи: ""
 *bg.Translation PageSize/Размер на хартията: ""
 *bg.PageSize A4/А4: ""
-"#;
+"#
+        .as_bytes();
 
         localize(&mut options, ppd, "bg");
 
@@ -402,15 +390,39 @@ mod tests {
             choices: vec![("A4".into(), "A4".into())],
             default: "A4".into(),
         }];
-        let ppd = br#"
+        let ppd = r#"
 *bg.OpenGroup: General/Общи: ""
 *bg.Translation PageSize/Размер на хартията: ""
 *bg.PageSize A4/А4: ""
-"#;
+"#
+        .as_bytes();
 
         localize(&mut options, ppd, "bg");
 
         assert_eq!(options[0].group, "Общи");
+        assert_eq!(options[0].label, "Размер на хартията");
+        assert_eq!(options[0].choices[0].1, "А4");
+    }
+
+    #[test]
+    fn localize_keeps_group_name_for_empty_localized_open_group_label() {
+        let mut options = vec![PrinterOption {
+            key: "PageSize".into(),
+            label: "Paper size".into(),
+            group: "General".into(),
+            choices: vec![("A4".into(), "A4".into())],
+            default: "A4".into(),
+        }];
+        let ppd = r#"
+*bg.OpenGroup: General/: ""
+*bg.Translation PageSize/Размер на хартията: ""
+*bg.PageSize A4/А4: ""
+"#
+        .as_bytes();
+
+        localize(&mut options, ppd, "bg");
+
+        assert_eq!(options[0].group, "General");
         assert_eq!(options[0].label, "Размер на хартията");
         assert_eq!(options[0].choices[0].1, "А4");
     }
